@@ -1,10 +1,10 @@
 name: Setup
 description: |
-  Authenticate to Pulumi ESC, export secrets to the job environment,
-  configure AWS credentials for ECR, and install Bun dependencies.
+  Assume AWS role via OIDC, export all secrets from Pulumi ESC,
+  and install Bun dependencies.
 
-  Replaces the old chamber-based setup. Secrets now come from ESC;
-  AWS OIDC is retained only for ECR push/pull and IAM operations.
+  PULUMI_ACCESS_TOKEN is provisioned as a GitHub repo secret by the vending machine
+  (vm provision / vm org-bootstrap), so no SSM bootstrap is needed here.
 
 inputs:
   pulumi-org:
