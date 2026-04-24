@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  workflow_call:
+    inputs:
+      pulumi-org:
+        description: Pulumi organization name
+        type: string
+        required: true
+      bun-version:
+        description: Bun version
+        type: string
+        default: "1.2.15"
+    secrets:
+      PULUMI_ACCESS_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+  packages: read
+  id-token: write
+
+jobs:
+  checks:
+    name: Lint & Typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup
+        with:
+          pulumi-org: ${{ inputs.pulumi-org }}
+          aws-account-id: ${{ vars.AWS_ACCOUNT_ID }}
+          aws-region: ${{ vars.AWS_REGION }}
+          env-slug: dev
+          bun-version: ${{ inputs.bun-version }}
+
+      - name: Lint
+        run: bun run lint
+
+      - name: Typecheck
+        run: bun run typecheck
+
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup
+        with:
+          pulumi-org: ${{ inputs.pulumi-org }}
+          aws-account-id: ${{ vars.AWS_ACCOUNT_ID }}
+          aws-region: ${{ vars.AWS_REGION }}
+          env-slug: dev
+          bun-version: ${{ inputs.bun-version }}
+
+      - name: Test
+        run: bunx turbo test

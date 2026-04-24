@@ -1,0 +1,306 @@
+name: Deploy
+
+on:
+  workflow_call:
+    inputs:
+      pulumi-org:
+        description: Pulumi organization name
+        type: string
+        required: true
+      bun-version:
+        description: Bun version
+        type: string
+        default: "1.2.15"
+    secrets:
+      PULUMI_ACCESS_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      web: ${{ steps.filter.outputs.web }}
+      api: ${{ steps.filter.outputs.api }}
+      proxy: ${{ steps.filter.outputs.proxy }}
+      studio: ${{ steps.filter.outputs.studio }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            web:
+              - 'apps/web/**'
+              - 'packages/**'
+              - 'bun.lock'
+              - '.github/workflows/deploy.yml'
+            api:
+              - 'apps/api/**'
+              - 'packages/**'
+              - 'bun.lock'
+              - 'config/**'
+              - '.kamal/**'
+              - 'Gemfile'
+              - 'Gemfile.lock'
+              - '.github/workflows/deploy.yml'
+            proxy:
+              - 'apps/preview-proxy/**'
+              - 'bun.lock'
+              - '.github/workflows/deploy.yml'
+            studio:
+              - 'apps/studio/**'
+              - 'bun.lock'
+              - '.github/workflows/deploy.yml'
+
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: app
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: app
+        ports:
+          - 5432
+        options: >-
+          --health-cmd "pg_isready -U app -d app"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup
+        with:
+          pulumi-org: ${{ inputs.pulumi-org }}
+          aws-account-id: ${{ vars.AWS_ACCOUNT_ID }}
+          aws-region: ${{ vars.AWS_REGION }}
+          env-slug: staging
+          bun-version: ${{ inputs.bun-version }}
+
+      - name: Run DB migrations
+        env:
+          DATABASE_URL: postgresql://app:app@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/app
+        run: bun run --cwd packages/db db:migrate
+
+      - name: Test
+        env:
+          DATABASE_URL: postgresql://app:app@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/app
+          API_BASE_URL: http://localhost:3001
+          WEB_BASE_URL: http://localhost:3000
+          PROXY_BASE_URL: http://localhost:8787
+        run: bunx turbo test
+
+  deploy-web:
+    name: Build & Deploy Web
+    needs: [changes]
+    if: needs.changes.outputs.web == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+      deployments: write
+    env:
+      PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup
+        with:
+          pulumi-org: ${{ inputs.pulumi-org }}
+          aws-account-id: ${{ vars.AWS_ACCOUNT_ID }}
+          aws-region: ${{ vars.AWS_REGION }}
+          env-slug: staging
+          bun-version: ${{ inputs.bun-version }}
+
+      - name: Export Pulumi stack outputs
+        run: bun --cwd infra ./scripts/export-kamal-env.ts staging
+
+      - name: Load env from Pulumi outputs
+        run: cat .kamal/pulumi.env >> "$GITHUB_ENV"
+
+      - name: Build web
+        env:
+          BUILD_HASH: ${{ github.sha }}
+        run: bun run --cwd apps/web build
+
+      - name: Deploy to Cloudflare Pages
+        id: cf-deploy-staging
+        run: |
+          bunx wrangler@4 pages deploy ./apps/web/dist/client \
+            --project-name=${{ env.CLOUDFLARE_PAGES_PROJECT }} \
+            --branch=main
+          echo "url=${{ env.WEB_BASE_URL }}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub deployment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const deployment = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.sha,
+              environment: 'staging',
+              description: 'Cloudflare Pages (staging)',
+              auto_merge: false,
+              required_contexts: [],
+            });
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: deployment.data.id,
+              state: 'success',
+              environment_url: '${{ steps.cf-deploy-staging.outputs.url }}',
+              description: 'Deployed to Cloudflare Pages',
+            });
+            core.summary.addLink('Staging deployment', '${{ steps.cf-deploy-staging.outputs.url }}');
+            await core.summary.write();
+
+  deploy-proxy:
+    name: Deploy Workers
+    needs: [changes]
+    if: needs.changes.outputs.proxy == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup
+        with:
+          pulumi-org: ${{ inputs.pulumi-org }}
+          aws-account-id: ${{ vars.AWS_ACCOUNT_ID }}
+          aws-region: ${{ vars.AWS_REGION }}
+          env-slug: staging
+          bun-version: ${{ inputs.bun-version }}
+
+      - name: Export Pulumi outputs
+        run: |
+          cd infra && bun ./scripts/export-kamal-env.ts staging
+          cat ../.kamal/pulumi.env >> "$GITHUB_ENV"
+
+      - name: Deploy preview proxy
+        run: |
+          bun run gen:wrangler
+          bunx wrangler@4 deploy --cwd apps/preview-proxy --env staging
+
+  deploy-api:
+    name: Deploy API
+    needs: [changes]
+    if: needs.changes.outputs.api == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup
+        with:
+          pulumi-org: ${{ inputs.pulumi-org }}
+          aws-account-id: ${{ vars.AWS_ACCOUNT_ID }}
+          aws-region: ${{ vars.AWS_REGION }}
+          env-slug: staging
+          bun-version: ${{ inputs.bun-version }}
+
+      - name: Export Pulumi stack outputs for Kamal
+        run: bun --cwd infra ./scripts/export-kamal-env.ts staging
+
+      - name: Load Kamal env
+        run: cat .kamal/pulumi.env >> "$GITHUB_ENV"
+
+      - name: Normalize AWS region
+        run: |
+          if [ -z "${AWS_REGION:-}" ]; then
+            echo "Missing AWS_REGION" >&2; exit 1
+          fi
+          echo "AWS_DEFAULT_REGION=$AWS_REGION" >> "$GITHUB_ENV"
+
+      - name: Check Tailscale pre-connectivity
+        id: ts-precheck
+        run: |
+          if ping -c 1 -W 5 "${{ env.KAMAL_WEB_HOSTS }}" &>/dev/null; then
+            echo "connected=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "connected=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create Tailscale auth key
+        if: steps.ts-precheck.outputs.connected != 'true'
+        run: |
+          key=$(curl -s -X POST \
+            "https://api.tailscale.com/api/v2/tailnet/${TS_TAILNET}/keys" \
+            -H "Authorization: Bearer ${TS_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d "{\"capabilities\":{\"devices\":{\"create\":{\"reusable\":false,\"ephemeral\":true,\"preauthorized\":true,\"tags\":[\"tag:${GITHUB_REPOSITORY##*/}-ci\"]}}},\"expirySeconds\":3600}" \
+            | jq -r .key)
+          echo "TS_AUTH_KEY=$key" >> "$GITHUB_ENV"
+
+      - name: Clear stale Tailscale cache
+        if: steps.ts-precheck.outputs.connected != 'true'
+        run: rm -f ~/.cache/tailscale.tgz
+
+      - uses: tailscale/github-action@v4
+        if: steps.ts-precheck.outputs.connected != 'true'
+        with:
+          authkey: ${{ env.TS_AUTH_KEY }}
+          args: --accept-dns=true
+          ping: ${{ env.KAMAL_WEB_HOSTS }}
+
+      - name: Configure SSH for Tailscale
+        if: steps.ts-precheck.outputs.connected != 'true'
+        run: |
+          mkdir -p ~/.ssh
+          printf 'Host *.ts.net\n  StrictHostKeyChecking no\n  ProxyCommand tailscale nc %%h %%p\n' >> ~/.ssh/config
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+          bundler-cache: true
+
+      - name: Ensure Docker uses IPv4 on server
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ env.KAMAL_SSH_USER }}@${{ env.KAMAL_WEB_HOSTS }} \
+            'if ! grep -q ipv6 /etc/docker/daemon.json 2>/dev/null; then
+               echo '"'"'{"ipv6":false,"ip6tables":false}'"'"' | sudo tee /etc/docker/daemon.json
+               sudo systemctl restart docker
+             fi'
+
+      - name: Free port 443 from tailscale serve
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ env.KAMAL_SSH_USER }}@${{ env.KAMAL_WEB_HOSTS }} \
+            'sudo tailscale serve --https=443 off 2>/dev/null || true'
+
+      - name: Release stale deploy lock
+        run: bundle exec kamal lock release || true
+
+      - name: Deploy via Kamal
+        env:
+          VERSION: sha-${{ github.sha }}
+        run: bundle exec kamal deploy
+
+      - name: Tag as staging-latest
+        run: |
+          docker buildx imagetools create \
+            --tag ${{ env.KAMAL_IMAGE }}:staging-latest \
+            ${{ env.KAMAL_IMAGE }}:sha-${{ github.sha }}
+
+      - name: Release deploy lock on failure
+        if: failure()
+        run: bundle exec kamal lock release || true

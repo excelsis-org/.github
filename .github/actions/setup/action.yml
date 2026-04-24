@@ -1,0 +1,70 @@
+name: Setup
+description: |
+  Authenticate to Pulumi ESC, export secrets to the job environment,
+  configure AWS credentials for ECR, and install Bun dependencies.
+
+  Replaces the old chamber-based setup. Secrets now come from ESC;
+  AWS OIDC is retained only for ECR push/pull and IAM operations.
+
+inputs:
+  pulumi-org:
+    description: Pulumi organization name (used to build the ESC path)
+    required: true
+  aws-account-id:
+    description: AWS account ID (pass vars.AWS_ACCOUNT_ID from the workflow)
+    required: true
+  aws-region:
+    description: AWS region
+    required: true
+  env-slug:
+    description: "Environment slug: dev | staging | production"
+    required: true
+  role-slug:
+    description: "Override the role segment: {repo}-{role-slug}-gha. Defaults to env-slug."
+    required: false
+  bun-version:
+    description: Bun version to install
+    default: "1.2.15"
+  skip-install:
+    description: Skip bun install (useful for jobs that only need secrets)
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: arn:aws:iam::${{ inputs.aws-account-id }}:role/${{ github.event.repository.name }}-${{ inputs.role-slug || inputs.env-slug }}-gha
+        role-session-name: gha-${{ github.event.repository.name }}-${{ inputs.env-slug }}
+        aws-region: ${{ inputs.aws-region }}
+
+    - name: Install esc CLI
+      shell: bash
+      run: |
+        if ! command -v esc &>/dev/null; then
+          curl -fsSL https://get.pulumi.com/esc/install.sh | sh
+          echo "$HOME/.pulumi/bin" >> "$GITHUB_PATH"
+        fi
+
+    - name: Export secrets from ESC
+      shell: bash
+      env:
+        PULUMI_ACCESS_TOKEN: ${{ env.PULUMI_ACCESS_TOKEN }}
+      run: |
+        esc env open ${{ inputs.pulumi-org }}/${{ github.event.repository.name }}/${{ inputs.env-slug }} \
+          --format dotenv >> "$GITHUB_ENV"
+
+    - uses: oven-sh/setup-bun@v2
+      with:
+        bun-version: ${{ inputs.bun-version }}
+
+    - name: Configure GitHub Packages auth
+      shell: bash
+      run: |
+        echo "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}" >> ~/.npmrc
+
+    - name: Install dependencies
+      if: inputs.skip-install != 'true'
+      shell: bash
+      run: bun install

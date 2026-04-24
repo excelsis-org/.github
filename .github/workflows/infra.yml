@@ -1,0 +1,55 @@
+name: Infra
+
+on:
+  workflow_call:
+    inputs:
+      pulumi-org:
+        description: Pulumi organization name
+        type: string
+        required: true
+      env:
+        description: "Environment: staging | production"
+        type: string
+        required: true
+      command:
+        description: "Pulumi command: up | preview | refresh | destroy"
+        type: string
+        required: true
+    secrets:
+      PULUMI_ACCESS_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  pulumi:
+    name: pulumi ${{ inputs.command }} (${{ inputs.env }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup
+        with:
+          pulumi-org: ${{ inputs.pulumi-org }}
+          aws-account-id: ${{ vars.AWS_ACCOUNT_ID }}
+          aws-region: ${{ vars.AWS_REGION }}
+          env-slug: ${{ inputs.env }}
+          role-slug: infra
+
+      - name: Install Pulumi CLI
+        run: |
+          if ! command -v pulumi &>/dev/null; then
+            curl -fsSL https://get.pulumi.com | sh
+            echo "$HOME/.pulumi/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Install infra deps
+        run: bun install --frozen-lockfile --cwd infra
+
+      - name: pulumi ${{ inputs.command }}
+        run: bun infra/scripts/run.ts ${{ inputs.env }} ${{ inputs.command }} --yes

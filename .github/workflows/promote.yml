@@ -1,0 +1,209 @@
+name: Promote to Production
+
+on:
+  workflow_call:
+    inputs:
+      pulumi-org:
+        description: Pulumi organization name
+        type: string
+        required: true
+      sha:
+        description: Git SHA to promote (leave empty to use calling workflow's sha)
+        type: string
+        default: ""
+      bun-version:
+        description: Bun version
+        type: string
+        default: "1.2.15"
+    secrets:
+      PULUMI_ACCESS_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  deployments: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  promote-api:
+    name: Promote API to Production
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    environment: production
+    env:
+      PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+
+      - uses: ./.github/actions/setup
+        with:
+          pulumi-org: ${{ inputs.pulumi-org }}
+          aws-account-id: ${{ vars.AWS_ACCOUNT_ID }}
+          aws-region: ${{ vars.AWS_REGION }}
+          env-slug: production
+          bun-version: ${{ inputs.bun-version }}
+
+      - name: Export production stack outputs for Kamal
+        run: bun --cwd infra ./scripts/export-kamal-env.ts production
+
+      - name: Load Kamal env
+        run: cat .kamal/pulumi.env >> "$GITHUB_ENV"
+
+      - name: Normalize AWS region
+        run: |
+          if [ -z "${AWS_REGION:-}" ]; then
+            echo "Missing AWS_REGION" >&2; exit 1
+          fi
+          echo "AWS_DEFAULT_REGION=$AWS_REGION" >> "$GITHUB_ENV"
+
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Retag staging-latest → production
+        run: |
+          docker buildx imagetools create \
+            --tag ${{ env.KAMAL_IMAGE }}:production-latest \
+            ${{ env.KAMAL_IMAGE }}:staging-latest
+          docker buildx imagetools create \
+            --tag ${{ env.KAMAL_IMAGE }}:sha-${{ inputs.sha || github.sha }} \
+            ${{ env.KAMAL_IMAGE }}:staging-latest
+
+      - name: Create Tailscale auth key
+        run: |
+          key=$(curl -s -X POST \
+            "https://api.tailscale.com/api/v2/tailnet/${TS_TAILNET}/keys" \
+            -H "Authorization: Bearer ${TS_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d "{\"capabilities\":{\"devices\":{\"create\":{\"reusable\":false,\"ephemeral\":true,\"preauthorized\":true,\"tags\":[\"tag:${GITHUB_REPOSITORY##*/}-ci\"]}}},\"expirySeconds\":3600}" \
+            | jq -r .key)
+          echo "TS_AUTH_KEY=$key" >> "$GITHUB_ENV"
+
+      - uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ env.TS_AUTH_KEY }}
+          args: --accept-dns=true
+          ping: ${{ env.KAMAL_WEB_HOSTS }}
+
+      - uses: ruby/setup-ruby@v1
+        id: setup-ruby
+        with:
+          ruby-version: "3.3"
+          bundler-cache: true
+
+      - name: Release stale deploy lock
+        run: bundle exec kamal lock release || true
+
+      - name: Deploy API to production via Kamal
+        env:
+          VERSION: sha-${{ inputs.sha || github.sha }}
+        run: bundle exec kamal deploy
+
+      - name: Release deploy lock on failure
+        if: failure() && steps.setup-ruby.outcome == 'success'
+        run: bundle exec kamal lock release
+
+  promote-web:
+    name: Promote Web to Production
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    env:
+      PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+
+      - uses: ./.github/actions/setup
+        with:
+          pulumi-org: ${{ inputs.pulumi-org }}
+          aws-account-id: ${{ vars.AWS_ACCOUNT_ID }}
+          aws-region: ${{ vars.AWS_REGION }}
+          env-slug: production
+          bun-version: ${{ inputs.bun-version }}
+
+      - name: Export production stack outputs
+        run: bun --cwd infra ./scripts/export-kamal-env.ts production
+
+      - name: Load env from Pulumi
+        run: cat .kamal/pulumi.env >> "$GITHUB_ENV"
+
+      - name: Build web
+        env:
+          BUILD_HASH: ${{ github.sha }}
+        run: bun run --cwd apps/web build
+
+      - name: Deploy to Cloudflare Pages
+        id: cf-deploy
+        run: |
+          set -o pipefail
+          bunx wrangler@4 pages deploy ./apps/web/dist/client \
+            --project-name=${{ env.CLOUDFLARE_PAGES_PROJECT }} \
+            --branch=main 2>&1 | tee /tmp/wrangler-out.txt
+          url=$(grep -oP 'https://[^\s]+\.pages\.dev[^\s]*' /tmp/wrangler-out.txt | tail -1)
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub deployment
+        if: steps.cf-deploy.outputs.url != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const deployment = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: '${{ inputs.sha || github.sha }}',
+              environment: 'production',
+              description: 'Cloudflare Pages (production)',
+              auto_merge: false,
+              required_contexts: [],
+            });
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: deployment.data.id,
+              state: 'success',
+              environment_url: '${{ steps.cf-deploy.outputs.url }}',
+              description: 'Deployed to Cloudflare Pages',
+            });
+            core.summary.addLink('Production deployment', '${{ steps.cf-deploy.outputs.url }}');
+            await core.summary.write();
+
+  promote-proxy:
+    name: Promote CMS Proxy to Production
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production
+    env:
+      PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+
+      - uses: ./.github/actions/setup
+        with:
+          pulumi-org: ${{ inputs.pulumi-org }}
+          aws-account-id: ${{ vars.AWS_ACCOUNT_ID }}
+          aws-region: ${{ vars.AWS_REGION }}
+          env-slug: production
+          bun-version: ${{ inputs.bun-version }}
+
+      - name: Export production stack outputs
+        run: bun --cwd infra ./scripts/export-kamal-env.ts production
+
+      - name: Load env from Pulumi
+        run: cat .kamal/pulumi.env >> "$GITHUB_ENV"
+
+      - name: Generate wrangler config
+        run: bun run gen:wrangler
+
+      - name: Deploy to Cloudflare Workers
+        run: |
+          bunx wrangler@4 deploy --cwd apps/proxy --env production \
+            --var SANITY_STUDIO_PROJECT_ID:$SANITY_STUDIO_PROJECT_ID \
+            --var SANITY_STUDIO_DATASET:$SANITY_STUDIO_DATASET
