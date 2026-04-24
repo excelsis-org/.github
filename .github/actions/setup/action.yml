@@ -49,8 +49,6 @@ runs:
 
     - name: Export secrets from ESC
       shell: bash
-      env:
-        PULUMI_ACCESS_TOKEN: ${{ env.PULUMI_ACCESS_TOKEN }}
       run: |
         esc env open ${{ inputs.pulumi-org }}/${{ github.event.repository.name }}/${{ inputs.env-slug }} \
           --format dotenv >> "$GITHUB_ENV"
