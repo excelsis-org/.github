@@ -51,7 +51,7 @@ runs:
       shell: bash
       run: |
         esc env open ${{ inputs.pulumi-org }}/${{ github.event.repository.name }}/${{ inputs.env-slug }} \
-          --format dotenv >> "$GITHUB_ENV"
+          --format json | jq -r '.environmentVariables | to_entries[] | "\(.key)=\(.value)"' >> "$GITHUB_ENV"
 
     - uses: oven-sh/setup-bun@v2
       with:
