@@ -84,7 +84,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: ./.github/actions/setup
+      - uses: excelsis-org/.github/.github/actions/setup@main
         with:
           pulumi-org: ${{ inputs.pulumi-org }}
           aws-account-id: ${{ vars.AWS_ACCOUNT_ID }}
@@ -120,7 +120,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: ./.github/actions/setup
+      - uses: excelsis-org/.github/.github/actions/setup@main
         with:
           pulumi-org: ${{ inputs.pulumi-org }}
           aws-account-id: ${{ vars.AWS_ACCOUNT_ID }}
@@ -182,7 +182,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: ./.github/actions/setup
+      - uses: excelsis-org/.github/.github/actions/setup@main
         with:
           pulumi-org: ${{ inputs.pulumi-org }}
           aws-account-id: ${{ vars.AWS_ACCOUNT_ID }}
@@ -211,7 +211,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: ./.github/actions/setup
+      - uses: excelsis-org/.github/.github/actions/setup@main
         with:
           pulumi-org: ${{ inputs.pulumi-org }}
           aws-account-id: ${{ vars.AWS_ACCOUNT_ID }}
