@@ -293,6 +293,9 @@ jobs:
       - name: Set registry password
         run: echo "KAMAL_REGISTRY_PASSWORD=${{ secrets.GITHUB_TOKEN }}" >> "$GITHUB_ENV"
 
+      - name: Boot accessories
+        run: bundle exec kamal accessory boot all 2>/dev/null || bundle exec kamal accessory reboot all
+
       - name: Deploy via Kamal
         env:
           VERSION: sha-${{ github.sha }}
